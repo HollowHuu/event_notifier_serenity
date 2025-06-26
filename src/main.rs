@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::{env, vec};
-use serenity::all::{GuildId, Member, ScheduledEvent, ScheduledEventId, ScheduledEventStatus, UserId};
+use std::collections::{HashMap, HashSet};
+use std::env;
+use serenity::all::{GuildId, Member, PartialMember, ScheduledEvent, ScheduledEventId, ScheduledEventStatus, User, UserId};
 use serenity::futures::channel;
 use serenity::{async_trait, http};
 use serenity::model::guild;
@@ -20,6 +20,30 @@ lazy_static! {
 }
 
 struct Handler;
+
+async fn handle_status_change(ctx: &Context, event: &ScheduledEvent) {
+    if event.channel_id.is_none() { return }
+    let channel = event.channel_id.unwrap().to_channel(&ctx.http()).await.unwrap().guild();
+    let members_opt = match channel {
+        Some(ref channel) => channel.members(&ctx).ok(),
+        _ => None,
+    };
+    
+    let guild_id = GuildId::new(env::var("GUILD_ID").expect("GUILD_ID missing!").parse().unwrap());
+    let interested_users = ctx.http().get_scheduled_event_users(guild_id, event.id, None, None, Some(true)).await.unwrap();
+
+    if members_opt.is_none() {return}
+    let members =  members_opt.unwrap();
+    let mem_ids: HashSet<u64> = members.iter().map(|mem| mem.user.id.get()).collect();
+    let user_ids: HashSet<u64> = interested_users.iter().map(|user| user.user.id.get() ).collect();
+    
+    spawn_threads_late_users(&ctx, user_ids.difference(&mem_ids).collect()).await;
+            
+}
+
+async fn spawn_threads_late_users(ctx: &Context, user_ids: Vec<&u64>) {
+
+}
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -50,9 +74,11 @@ impl EventHandler for Handler {
         // Alternatively, fetch full event list on each update and diff, but this is costly and still can't recover past state
         // Memory/disk-backed buffer is most reliable
 
-        
+         
+        // Accessing buffer
         let mut prior_event: Option<ScheduledEvent> = None;
         if event.status == ScheduledEventStatus::Active {
+            // Accessing EVENT_BUFFER inside scope to avoid locking it for the entire duration of the function
             let event_buffer = EVENT_BUFFER.lock().unwrap();
             let event = event_buffer.get(&event.id);
             if event.is_some() {
@@ -60,29 +86,14 @@ impl EventHandler for Handler {
             }
         }
 
+        // If there's no prior event, it's guaranteed to just have been created or made public
+        // in which case we can't compare it either way
         if prior_event.is_none() { return }
         else if prior_event.unwrap().status == ScheduledEventStatus::Scheduled && event.status == ScheduledEventStatus::Active {
-            if event.channel_id.is_none() { return }
-            let channel = event.channel_id.unwrap().to_channel(&ctx.http()).await.unwrap().guild();
-            let members = match channel {
-                Some(ref channel) => channel.members(&ctx).ok(),
-                _ => None,
-            };
+            handle_status_change(&ctx, &event).await;
+        }  
 
-            let guild_id = GuildId::new(env::var("GUILD_ID").expect("GUILD_ID missing!").parse().unwrap());
-            let interested_users = ctx.http().get_scheduled_event_users(guild_id, event.id, None, None, Some(true)).await.unwrap();
-
-            match members {
-                Some(ref members) => {
-                    let interested_members = interested_users.iter().map(|x| &x.member); 
-                    for member in members.to_owned().iter() {
-                        // TODO - continue from here, lowkey too tired
-                    }
-                } ,
-                None => return
-            }
-            
-        }
+        EVENT_BUFFER.lock().unwrap().insert(event.id, event);
 
     }
 }
